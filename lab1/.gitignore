@@ -1,5 +1,5 @@
 *
 !.gitignore
-!*.c
+!*.cpp
 !*.h
 !Makefile

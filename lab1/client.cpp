@@ -37,12 +37,6 @@ ssize_t send_request_with_fd(int socket_fd, const Request* req, int efd_to_send)
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::cerr << "Usage: " << argv[0] << " <priority> <command> <value>\n";
-        std::cerr << "Commands:\n"
-                  << "  0: COMMAND_NOP\n"
-                  << "  1: COMMAND_WAIT (value in sec)\n"
-                  << "  2: COMMAND_ECHO\n"
-                  << "  3: COMMAND_NEG\n"
-                  << "  4: COMMAND_TIMER (value in sec - async notify via eventfd)\n";
         return 1;
     }
 

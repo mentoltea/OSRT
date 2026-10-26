@@ -19,7 +19,7 @@
 #include <semaphore.h>
 #include <chrono>
 
-int worker_count = 2; 
+int worker_count = 1; 
 int server_fd = -1;
 
 struct ClientRequest {

@@ -26,6 +26,7 @@ struct ClientRequest {
     Request request;
     int client_fd;
     int eventfd_fd;
+    sem_t* done;
 
     bool operator<(const ClientRequest& other) const {
         return this->request.priority < other.request.priority;
@@ -110,8 +111,8 @@ void handle_timer_request(ClientRequest req) {
     answer.value = req.request.value;
     write(req.client_fd, &answer, sizeof(answer));
 
-    cleanup_client_resources(req.client_fd, req.eventfd_fd);
-    std::cout << "[Timer Thread] Timer finished and client #" << req.client_fd << " closed." << std::endl;
+    std::cout << "[Timer Thread] Timer finished for client #" << req.client_fd << std::endl;
+    sem_post(req.done);
 }
 
 void worker(int id) {
@@ -128,9 +129,9 @@ void worker(int id) {
                   << "\teventfd #" << request.eventfd_fd << std::endl 
                   << "\tpriority " << request.request.priority << std::endl; 
 
-        if (request.request.command == COMMAND_TIMER) {
+        if (request.request.command == COMMAND_TIMER && request.request.value >= 0) {
             std::thread(handle_timer_request, request).detach();
-            continue; 
+            continue;
         }
 
         Answer answer;
@@ -141,13 +142,20 @@ void worker(int id) {
             case COMMAND_NOP: {
             } break;
             case COMMAND_WAIT: {
-                sleep(request.request.value);
+                if (request.request.value < 0) {
+                    answer.type = -1;
+                } else {
+                    sleep(request.request.value);
+                }
             } break;
             case COMMAND_ECHO: {
                 answer.value = request.request.value;
             } break;
             case COMMAND_NEG: {
                 answer.value = -request.request.value;
+            } break;
+            case COMMAND_TIMER: { // отрицательное N
+                answer.type = -1;
             } break;
             default: {
                 answer.type = -1;
@@ -156,8 +164,60 @@ void worker(int id) {
 
         write(request.client_fd, &answer, sizeof(answer));
 
-        cleanup_client_resources(request.client_fd, request.eventfd_fd);
+        sem_post(request.done);
     }
+}
+
+void client_session(int client_fd) {
+    int eventfd_fd = -1;
+    sem_t done;
+    sem_init(&done, 0, 0);
+
+    while (true) {
+        ClientRequest request;
+        request.client_fd = client_fd;
+        request.done = &done;
+
+        int received_fd = -1;
+        ssize_t bytes = read_request_with_fd(client_fd, &request.request, &received_fd);
+
+        if (received_fd != -1) {
+            if (eventfd_fd == -1) {
+                eventfd_fd = received_fd;
+                std::lock_guard<std::mutex> lock(active_eventfds_mutex);
+                active_eventfds.push_back(eventfd_fd);
+            } else {
+                close(received_fd);
+            }
+        }
+
+        if (bytes == -1) {
+            perror("read error");
+            break;
+        }
+
+        if (bytes == 0) {
+            break;
+        }
+
+        if (bytes != sizeof(Request)) {
+            std::cerr << "[Server] Protocol violation from client #" << client_fd << std::endl;
+            break;
+        }
+
+        request.eventfd_fd = eventfd_fd;
+        {
+            std::lock_guard<std::mutex> lock(client_queue_mutex);
+            client_queue.push(request);
+        }
+        sem_post(&client_queue_semaphore);
+
+        sem_wait(&done);
+    }
+
+    cleanup_client_resources(client_fd, eventfd_fd);
+    sem_destroy(&done);
+    std::cout << "[Server] Client #" << client_fd << " session closed" << std::endl;
 }
 
 void cleanup_and_exit(int signal) {
@@ -182,6 +242,8 @@ void cleanup_and_exit(int signal) {
 int main() {
     signal(SIGINT, cleanup_and_exit);
     signal(SIGTERM, cleanup_and_exit);
+
+    signal(SIGPIPE, SIG_IGN);
 
     if (sem_init(&client_queue_semaphore, 0, 0) == -1) {
         perror("semaphore init error");
@@ -234,34 +296,7 @@ int main() {
 
         std::cout << "[Server] Client #" << client_fd << " connected" << std::endl;
 
-        ClientRequest request;
-        request.client_fd = client_fd;
-        
-        ssize_t bytes = read_request_with_fd(client_fd, &request.request, &request.eventfd_fd);
-        
-        if (bytes == -1) {
-            perror("read error");
-            close(client_fd);
-            continue;
-        }
-
-        if (bytes != sizeof(Request)) {
-            perror("protocol violation");
-            close(client_fd);
-            if (request.eventfd_fd != -1) close(request.eventfd_fd);
-            continue;
-        }
-
-        if (request.eventfd_fd != -1) {
-            std::lock_guard<std::mutex> lock(active_eventfds_mutex);
-            active_eventfds.push_back(request.eventfd_fd);
-        }
-        
-        {
-            std::lock_guard<std::mutex> lock(client_queue_mutex);
-            client_queue.push(request);
-        }
-        sem_post(&client_queue_semaphore);
+        std::thread(client_session, client_fd).detach();
     }
 
     close(server_fd);

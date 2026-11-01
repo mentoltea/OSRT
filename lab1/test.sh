@@ -185,6 +185,70 @@ check "залогированы все уведомления ($notified из 4)
 check "залогированы завершения таймеров ($timers из 4)" [ "$timers" -eq 4 ]
 
 # ---------------------------------------------------------------------------
+section "Отключение клиента до ответа (SIGPIPE)"
+# Клиент умирает, пока сервер выполняет WAIT/TIMER; write() сервера в закрытый сокет
+# не должен его ронять.
+./client 0 $CMD_WAIT 2 > "$OUT/killed_wait.out" 2>&1 & kpid=$!
+sleep 0.5; kill -TERM "$kpid"; wait "$kpid" 2>/dev/null
+./client 0 $CMD_TIMER 1 > "$OUT/killed_timer.out" 2>&1 & kpid=$!
+sleep 0.3; kill -TERM "$kpid"; wait "$kpid" 2>/dev/null
+sleep 2
+check "сервер жив после отключения клиентов во время WAIT и TIMER" kill -0 "$SERVER_PID"
+run_client after_kill 0 $CMD_ECHO 5
+check "после этого сервер отвечает: ECHO 5 -> {0, 5}" [ "$(answer_of "$OUT/after_kill.out")" = "0 5" ]
+
+# ---------------------------------------------------------------------------
+section "Молчащий клиент не блокирует остальных"
+# Клиент в режиме stdin подключается и молчит, пока нет ввода
+sleep 3 | ./client 0 > "$OUT/silent.out" 2>&1 & spid=$!
+sleep 0.3
+s0=$(now_ms)
+timeout 5 ./client 0 $CMD_ECHO 9 > "$OUT/not_blocked.out" 2>&1
+sdt=$(( $(now_ms) - s0 ))
+check "ECHO при подключённом молчащем клиенте обслужен сразу (${sdt} мс < 1000)" [ "$sdt" -lt 1000 ]
+check "ECHO 9 -> {0, 9}" [ "$(answer_of "$OUT/not_blocked.out")" = "0 9" ]
+wait "$spid"
+
+# ---------------------------------------------------------------------------
+section "Несколько запросов по одному соединению"
+answers_of() { answer_of "$1" | tr '\n' ',' | sed 's/,$//'; }
+
+log_start=$(wc -l < "$SERVER_LOG")
+./client 5 $CMD_ECHO 42 $CMD_NEG 7 $CMD_TIMER 1 $CMD_TIMER 1 > "$OUT/multi.out" 2>&1
+log_new=$(tail -n +"$((log_start + 1))" "$SERVER_LOG")
+check "4 ответа по порядку: ECHO 42, NEG 7, TIMER 1, TIMER 1" \
+    [ "$(answers_of "$OUT/multi.out")" = "0 42,0 -7,0 1,0 1" ]
+check "одно подключение на 4 запроса" [ "$(grep -c " connected" <<< "$log_new")" -eq 1 ]
+check "сервер обработал 4 запроса" [ "$(grep -c "picked up client" <<< "$log_new")" -eq 4 ]
+check "eventfd передан один раз" [ "$(grep -c "with eventfd" "$OUT/multi.out")" -eq 1 ]
+check "оба таймера уведомили через один и тот же eventfd" \
+    [ "$(grep -c "ASYNC TIMER NOTIFICATION" "$OUT/multi.out")" -eq 2 ]
+
+# Режим stdin; пауза между запросами — соединение держится
+( echo "$CMD_ECHO 1"; sleep 1; echo "$CMD_NEG 2" ) | ./client 0 > "$OUT/stdin.out" 2>&1
+check "stdin: ECHO 1, пауза, NEG 2 -> {0, 1}, {0, -2}" [ "$(answers_of "$OUT/stdin.out")" = "0 1,0 -2" ]
+
+# ---------------------------------------------------------------------------
+section "Отрицательное N"
+t0=$(now_ms)
+timeout 3 ./client 0 $CMD_TIMER -3 > "$OUT/timer_neg.out" 2>&1
+dt=$(( $(now_ms) - t0 ))
+check "TIMER -3 -> {-1, 0}" [ "$(answer_of "$OUT/timer_neg.out")" = "-1 0" ]
+check "TIMER -3: уведомление не отправлено (${dt} мс)" \
+    [ "$(grep -c "ASYNC TIMER NOTIFICATION" "$OUT/timer_neg.out")" -eq 0 ]
+timeout 3 ./client 0 $CMD_WAIT -1 > "$OUT/wait_neg.out" 2>&1
+check "WAIT -1 -> {-1, 0} (а не sleep((unsigned)-1))" [ "$(answer_of "$OUT/wait_neg.out")" = "-1 0" ]
+timeout 3 ./client 0 $CMD_ECHO 1 > "$OUT/after_neg.out" 2>&1
+check "после отрицательных N воркер свободен: ECHO 1 -> {0, 1}" [ "$(answer_of "$OUT/after_neg.out")" = "0 1" ]
+
+# ---------------------------------------------------------------------------
+section "Закрытие соединений"
+sleep 0.2
+connected=$(grep -c " connected" "$SERVER_LOG")
+closed=$(grep -c "session closed" "$SERVER_LOG")
+check "все соединения закрыты сервером ($closed из $connected)" [ "$closed" -eq "$connected" ]
+
+# ---------------------------------------------------------------------------
 section "Завершение сервера по SIGINT"
 kill -INT "$SERVER_PID"
 wait "$SERVER_PID" 2>/dev/null
